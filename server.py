@@ -110,7 +110,7 @@ class Service:
             raise ValueError("No hay webhook configurado.")
         webhook = validate_webhook(lines[0])
         async with self.webhook_lock:
-            if time.monotonic() < self.webhook_next_request:
+            if time.monotonic() < self.webhook_next_request or time.time() < self.store.cooldown_deadline():
                 raise ValueError("Discord limitó el webhook. Espera antes de volver a intentarlo.")
             try:
                 async with self.session.post(webhook, json={"content": content, "allowed_mentions": {"parse": []}},
@@ -120,10 +120,14 @@ class Service:
                             data = await response.json()
                         except (ValueError, aiohttp.ContentTypeError):
                             data = {}
-                        self.webhook_next_request = time.monotonic() + retry_delay(data, response.headers)
+                        delay = max(1.0, retry_delay(data, response.headers))
+                        self.webhook_next_request = time.monotonic() + delay
+                        self.manager.defer_for(delay)
                         raise ValueError("Discord limitó el webhook. Espera antes de volver a intentarlo.")
                     if response.headers.get("X-RateLimit-Remaining") == "0":
-                        self.webhook_next_request = time.monotonic() + retry_delay({}, {"Retry-After": response.headers.get("X-RateLimit-Reset-After")})
+                        delay = retry_delay({}, response.headers)
+                        self.webhook_next_request = time.monotonic() + delay
+                        self.manager.defer_for(delay)
                     if response.status not in (200, 204):
                         raise ValueError("Discord rechazó el webhook. Revisa la URL y vuelve a intentarlo.")
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError):

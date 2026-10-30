@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -104,8 +105,18 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 400)
             self.assertEqual((await self.post('/api/webhook/test', {})).status, 400)
             send.assert_called_once()
+            self.assertGreater(self.app[SERVICE].store.cooldown_deadline(), time.time())
+            self.assertGreater(self.app[SERVICE].manager.next_request, time.monotonic())
             self.assertFalse(send.call_args.kwargs['allow_redirects'])
             self.assertEqual(send.call_args.kwargs['json']['allowed_mentions'], {'parse': []})
+
+    async def test_webhook_respects_query_cooldown(self):
+        await self.post('/api/connections', {'webhook': 'https://discord.com/api/webhooks/1/test'})
+        self.app[SERVICE].manager.defer_for(30)
+        with patch.object(self.app[SERVICE].session, 'post') as send:
+            response = await self.post('/api/webhook/test', {})
+            self.assertEqual(response.status, 400)
+            send.assert_not_called()
 
 
 if __name__ == '__main__':

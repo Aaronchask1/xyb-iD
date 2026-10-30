@@ -3,7 +3,7 @@ Set-Location -LiteralPath $PSScriptRoot
 
 $pythonExe = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $pythonExe)) {
-    Write-Host 'No se encuentra el entorno .venv. Consulta README.md para instalarlo.' -ForegroundColor Red
+    Write-Host 'No se encuentra el entorno .venv. Ejecuta primero Instalar xyb.bat.' -ForegroundColor Red
     Read-Host 'Pulsa Enter para cerrar'
     exit 1
 }

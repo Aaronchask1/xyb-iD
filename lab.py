@@ -185,9 +185,14 @@ class DiscordClient:
         started = time.monotonic()
         result = Result(name, mode, "unverified", "No se obtuvo una respuesta válida.")
         for attempt in range(3):
-            wait = max(0, self.next_request - time.monotonic())
-            if wait:
-                await asyncio.sleep(wait)
+            # A concurrent webhook may extend the shared deadline while sleeping.
+            while True:
+                deadline = self.next_request
+                wait = max(0, deadline - time.monotonic())
+                if wait:
+                    await asyncio.sleep(wait)
+                if self.next_request <= deadline:
+                    break
             self.wait_until = 0
             if self.on_wait:
                 self.on_wait(0)
@@ -264,6 +269,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS favorites (
                 mode TEXT NOT NULL, candidate TEXT NOT NULL, created_at TEXT NOT NULL,
                 PRIMARY KEY(mode, candidate));
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                key TEXT PRIMARY KEY, value REAL NOT NULL);
         """)
         self.db.execute("UPDATE jobs SET state='interrupted' WHERE state IN ('running','paused','waiting')")
         self.db.commit()
@@ -272,6 +279,15 @@ class Store:
         self.db.close()
         if not self._file_lock.closed:
             self._file_lock.close()
+
+    def cooldown_deadline(self):
+        row = self.db.execute("SELECT value FROM runtime_state WHERE key='discord_cooldown'").fetchone()
+        return row[0] if row and math.isfinite(row[0]) else 0.0
+
+    def remember_cooldown(self, deadline):
+        if math.isfinite(deadline) and deadline > self.cooldown_deadline():
+            self.db.execute("INSERT OR REPLACE INTO runtime_state VALUES ('discord_cooldown', ?)", (deadline,))
+            self.db.commit()
 
     def create(self, mode, candidates, options):
         job_id, now = uuid.uuid4().hex[:12], utcnow()
@@ -387,12 +403,22 @@ class JobManager:
         self.client = None
         self.started = 0
         self.saved_on_start = 0
-        self.cooldown_until = 0.0
-        self.next_request = 0.0
+        self.cooldown_until = self.store.cooldown_deadline()
+        self.next_request = time.monotonic() + max(0, self.cooldown_until - time.time())
         self.finished = None
 
     def busy(self):
         return self.task is not None and not self.task.done()
+
+    def defer_for(self, delay):
+        """Share a conservative Discord cooldown across requests and restarts."""
+        if delay <= 0:
+            return
+        self.cooldown_until = max(self.cooldown_until, time.time() + delay)
+        self.next_request = max(self.next_request, time.monotonic() + delay)
+        if self.client:
+            self.client.next_request = max(self.client.next_request, self.next_request)
+        self.store.remember_cooldown(self.cooldown_until)
 
     def start(self, mode, candidates, options, proxy=None):
         if self.busy():
@@ -408,7 +434,7 @@ class JobManager:
         self.gate.set()
         self.started = time.monotonic()
         self.saved_on_start = self.store.get_job(job_id)["completed"]
-        self.cooldown_until = 0
+        self.cooldown_until = max(self.cooldown_until, self.store.cooldown_deadline())
         self.finished = None
         self.client = None
         self.task = asyncio.create_task(self._run(job_id, proxy))
@@ -418,7 +444,10 @@ class JobManager:
         opts = job["options"]
         done = {row[0] for row in self.store.db.execute("SELECT candidate FROM results WHERE job_id=?", (job_id,))}
         def on_wait(delay):
-            self.cooldown_until = time.time() + delay if delay else 0
+            if delay:
+                self.defer_for(delay)
+            elif self.cooldown_until <= time.time():
+                self.cooldown_until = 0
         self.client = self.client_factory(self.session, delay=opts["delay"], timeout=opts["timeout"], proxy=proxy, on_wait=on_wait)
         self.client.next_request = max(self.next_request, getattr(self.client, "next_request", 0))
         try:
@@ -434,6 +463,9 @@ class JobManager:
                 else:
                     result = await self.client.check(job["mode"], name)
                 self.store.save(job_id, result)
+                if result.http_status in (401, 403):
+                    self.store.state(job_id, "failed", f"Discord rechazó la solicitud (HTTP {result.http_status}). Se detuvo la sesión; revisa la conexión antes de continuar.")
+                    return
             self.store.state(job_id, "completed")
             if self.on_complete:
                 try:

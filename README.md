@@ -4,7 +4,7 @@ Herramienta local para organizar y consultar nombres de usuario de Discord y enl
 
 ## Abrir
 
-Haz doble clic en **Abrir xyb.bat** dentro de `D:\nuevo`. Se abrirá el panel en el navegador:
+En Windows, ejecuta **Instalar xyb.bat** una vez y después haz doble clic en **Abrir xyb.bat** dentro de la carpeta del proyecto. Se abrirá el panel en el navegador:
 
 http://127.0.0.1:8765
 
@@ -15,7 +15,7 @@ cd D:\nuevo
 .\.venv\Scripts\python.exe server.py
 ```
 
-Si ya está abierto, el lanzador vuelve a abrir el panel existente. Para cerrar el servidor usa **Ajustes → Guardar y cerrar aplicación** o Ctrl+C en la terminal. Cerrar únicamente la pestaña deja la sesión ejecutándose.
+Si ya está abierto, el lanzador vuelve a abrir el panel existente. Para cerrar el servidor usa **Ajustes → Guardar y cerrar aplicación** o Ctrl+C en la terminal. Cerrar únicamente la pestaña deja la sesión ejecutándose. El servidor es local: cada persona ejecuta su propia copia en su computadora.
 
 La interfaz clásica continúa disponible mediante **Abrir xyb clasico.bat** o `checker.py`. Los archivos anteriores de `data` y `results` se conservan.
 
@@ -56,12 +56,13 @@ La consulta de usuarios conserva el endpoint no documentado que utilizaba el pro
 
 ## Conexión y datos
 
-La interfaz nueva utiliza una solicitud a la vez y un intervalo configurable de 1 a 60 segundos. Respeta `retry_after`, `Retry-After` y los encabezados de agotamiento de cuota. Cambiar de proxy no evita la espera. Tras tres intentos sin respuesta concluyente, el resultado queda sin verificar. Las notificaciones usan su propio límite y muestran un error si Discord las rechaza.
+La interfaz utiliza una solicitud de consulta a la vez y un intervalo configurable de 1 a 60 segundos. Respeta `retry_after`, `Retry-After` y los encabezados de agotamiento de cuota. Las esperas se conservan al reiniciar y se comparten de forma conservadora con los webhooks; cambiar de proxy no evita la espera. Si Discord rechaza el acceso con 401 o 403, la sesión se detiene con los resultados guardados. Tras tres intentos sin respuesta concluyente, el resultado queda sin verificar. Una notificación rechazada o bloqueada por una espera se muestra como error y no se reenvía automáticamente.
 
 - `results/lab.sqlite3`: sesiones, resultados y favoritos nuevos.
 - `data/lab_settings.json`: ajustes de la interfaz nueva, sin tokens de usuario.
 - `web/`: interfaz local; no necesita CDNs, fuentes remotas ni compilación con Node.
 - `docs/RESEARCH-2026-10-29.md`: repositorios y documentación revisados.
+- `docs/RESEARCH-2026-10-29-LIMITS.md`: revisión de los límites de Discord.
 - `docs/README-v3.md`: documentación previa conservada como referencia histórica.
 
 No se importan automáticamente los antiguos resultados como conclusiones actuales. Puedes cargar las listas y consultarlas de nuevo. No se reescriben los históricos anteriores.
@@ -70,14 +71,24 @@ El servidor escucha solo en `127.0.0.1`; las escrituras exigen un token de la se
 
 ## Instalación y pruebas
 
-El entorno existente fue probado con Python 3.15, aiohttp 3.14.5 y rich 15.0.0 en Windows. No se ha sustituido tu entorno.
+Necesitas Python 3.10 o superior y conexión a Internet durante la instalación. En Windows se recomienda Python 3.13, disponible en [python.org](https://www.python.org/downloads/). El entorno existente se probó también con Python 3.15, aiohttp 3.14.5 y rich 15.0.0. El repositorio es privado: quienes quieran descargarlo necesitan acceso concedido por su propietario.
 
-Para crear otro entorno:
+En Windows, ejecuta **Instalar xyb.bat** o instala manualmente desde PowerShell abierto en la carpeta descargada:
 
 ```powershell
-python -m venv .venv
+py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+En macOS o Linux, desde la carpeta del proyecto:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+sh run.sh
+```
+
+Para la interfaz clásica en macOS o Linux, usa `.venv/bin/python checker.py`. Las instrucciones de macOS y Linux no se han probado en este equipo Windows.
 
 Pruebas locales, sin consultar Discord ni enviar webhooks:
 
