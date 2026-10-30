@@ -131,7 +131,7 @@ def classify_response(status: int, data) -> bool | str:
 
 def retry_delay(data, headers) -> float:
     """Use valid server delays; malformed bodies must not bypass a cooldown."""
-    candidates = [headers.get("Retry-After")]
+    candidates = [headers.get("Retry-After"), headers.get("X-RateLimit-Reset-After")]
     if isinstance(data, dict):
         candidates.append(data.get("retry_after"))
     delays = []

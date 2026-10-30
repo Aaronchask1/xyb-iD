@@ -5,10 +5,12 @@ import argparse
 import asyncio
 import json
 import math
+import re
 import secrets
 import socket
 import sqlite3
 import sys
+import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,9 +22,10 @@ from aiohttp import web
 from config import DATA_DIR, PROJECT_ROOT, RESULTS_DIR, atomic_write_text, load_lines
 from lab import JobManager, Store, export_rows, generate_candidates, parse_candidates
 from proxy import ProxyManager
+from engine import retry_delay
 
 VERSION = "4.0.0"
-DEFAULTS = {"delay": 1.5, "timeout": 15, "use_proxy": False}
+DEFAULTS = {"delay": 1.5, "timeout": 15, "use_proxy": False, "webhook_enabled": False}
 INPUT_FILES = {
     "names": DATA_DIR / "names_to_check.txt",
     "combinations": DATA_DIR / "custom_combinations.txt",
@@ -40,8 +43,9 @@ def validate_options(data):
         value = options[key]
         if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not low <= value <= high:
             raise ValueError(f"{key}: introduce un número entre {low} y {high} segundos.")
-    if type(options["use_proxy"]) is not bool:
-        raise ValueError("use_proxy debe ser verdadero o falso.")
+    for key in ("use_proxy", "webhook_enabled"):
+        if type(options[key]) is not bool:
+            raise ValueError(f"{key} debe ser verdadero o falso.")
     return options
 
 
@@ -50,6 +54,11 @@ class Service:
         self.root = root
         self.token = secrets.token_urlsafe(32)
         self.settings_path = root / "data" / "lab_settings.json"
+        self.proxy_path = root / "data" / "proxies.txt"
+        self.webhook_path = root / "data" / "lab_webhook.txt"
+        self.webhook_status = ""
+        self.webhook_next_request = 0.0
+        self.webhook_lock = asyncio.Lock()
         self.settings = dict(DEFAULTS)
         self.settings_error = ""
         if self.settings_path.exists():
@@ -67,7 +76,7 @@ class Service:
     async def start(self):
         self.session = aiohttp.ClientSession(trust_env=False, headers={"User-Agent": "XYB-Lab/4.0 (local desktop tool)"})
         kwargs = {"client_factory": self.client_factory} if self.client_factory else {}
-        self.manager = JobManager(self.store, self.session, **kwargs)
+        self.manager = JobManager(self.store, self.session, on_complete=self.notify_complete, **kwargs)
 
     async def close(self):
         if self.manager:
@@ -79,7 +88,7 @@ class Service:
     def proxy(self, options):
         if not options.get("use_proxy"):
             return None
-        lines = load_lines(self.root / "data" / "proxies.txt")
+        lines = load_lines(self.proxy_path)
         if not lines:
             raise ValueError("No hay proxy configurado en data/proxies.txt.")
         value = ProxyManager._format(lines[0])
@@ -90,6 +99,51 @@ class Service:
         except ValueError:
             raise ValueError("La primera línea de data/proxies.txt no tiene un formato de proxy válido.")
         return value
+
+    def connections(self):
+        return {"proxy_configured": bool(load_lines(self.proxy_path)),
+                "webhook_configured": bool(load_lines(self.webhook_path))}
+
+    async def send_webhook(self, content):
+        lines = load_lines(self.webhook_path)
+        if not lines:
+            raise ValueError("No hay webhook configurado.")
+        webhook = validate_webhook(lines[0])
+        async with self.webhook_lock:
+            if time.monotonic() < self.webhook_next_request:
+                raise ValueError("Discord limitó el webhook. Espera antes de volver a intentarlo.")
+            try:
+                async with self.session.post(webhook, json={"content": content, "allowed_mentions": {"parse": []}},
+                                             timeout=aiohttp.ClientTimeout(total=10), allow_redirects=False) as response:
+                    if response.status == 429:
+                        try:
+                            data = await response.json()
+                        except (ValueError, aiohttp.ContentTypeError):
+                            data = {}
+                        self.webhook_next_request = time.monotonic() + retry_delay(data, response.headers)
+                        raise ValueError("Discord limitó el webhook. Espera antes de volver a intentarlo.")
+                    if response.headers.get("X-RateLimit-Remaining") == "0":
+                        self.webhook_next_request = time.monotonic() + retry_delay({}, {"Retry-After": response.headers.get("X-RateLimit-Reset-After")})
+                    if response.status not in (200, 204):
+                        raise ValueError("Discord rechazó el webhook. Revisa la URL y vuelve a intentarlo.")
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                raise ValueError("No se pudo conectar con el webhook de Discord.") from None
+
+    async def notify_complete(self, job_id):
+        job = self.store.get_job(job_id)
+        if not job["options"].get("webhook_enabled", False):
+            return
+        try:
+            await self.send_webhook(f"XYB: sesión de {'usuarios' if job['mode'] == 'username' else 'vanities'} completada. Resultados: {job['completed']} / {job['total']}.")
+            self.webhook_status = "Notificación enviada."
+        except (ValueError, OSError):
+            self.webhook_status = "No se pudo enviar la notificación. Revisa la configuración del webhook."
+
+
+def validate_webhook(value):
+    if not isinstance(value, str) or not re.fullmatch(r"https://(?:discord\.com|discordapp\.com)/api(?:/v\d+)?/webhooks/\d+/[A-Za-z0-9._-]+", value):
+        raise ValueError("Introduce una URL de webhook válida de Discord.")
+    return value
 
 
 @web.middleware
@@ -139,13 +193,13 @@ async def bootstrap(request):
     inputs = [{"id": key, "name": str(path.relative_to(PROJECT_ROOT)).replace("\\", "/")}
               for key, path in INPUT_FILES.items() if (s.root / path.relative_to(PROJECT_ROOT)).is_file()]
     return web.json_response({"app": "xyb-lab", "version": VERSION, "token": s.token, "settings": s.settings,
-                              "settings_error": s.settings_error, "inputs": inputs})
+                              "settings_error": s.settings_error, "inputs": inputs, "connections": s.connections()})
 
 
 async def state(request):
     s = request.app[SERVICE]
     counts = [dict(row) for row in s.store.db.execute("SELECT mode,status,COUNT(*) AS count FROM results GROUP BY mode,status")]
-    return web.json_response({"active": s.manager.live(), "jobs": s.store.jobs(), "counts": counts,
+    return web.json_response({"active": s.manager.live(), "jobs": s.store.jobs(), "counts": counts, "webhook_status": s.webhook_status,
                               "favorites": s.store.favorites()})
 
 
@@ -160,6 +214,7 @@ async def create_job(request):
         raise ValueError("El modo local debe ser verdadero o falso.")
     options["offline"] = offline
     job_id = s.manager.start(mode, names, options, s.proxy(options) if not offline else None)
+    s.webhook_status = ""
     return web.json_response({"id": job_id, "duplicates": duplicates}, status=201)
 
 
@@ -230,6 +285,48 @@ async def settings(request):
     return web.json_response(updated)
 
 
+async def connections(request):
+    s = request.app[SERVICE]
+    body = await payload(request)
+    if any(key not in {"proxy", "webhook", "clear_proxy", "clear_webhook"} for key in body):
+        raise ValueError("Opción de conexión desconocida.")
+    for key in ("clear_proxy", "clear_webhook"):
+        if key in body and type(body[key]) is not bool:
+            raise ValueError("Opción de eliminación inválida.")
+    proxy = body.get("proxy", "")
+    webhook = body.get("webhook", "")
+    if not isinstance(proxy, str) or not isinstance(webhook, str):
+        raise ValueError("La conexión debe ser texto.")
+    proxy, webhook = proxy.strip(), webhook.strip()
+    if proxy and body.get("clear_proxy") or webhook and body.get("clear_webhook"):
+        raise ValueError("No se puede guardar y eliminar el mismo dato a la vez.")
+    if proxy:
+        value = ProxyManager._format(proxy)
+        try:
+            parsed = urlparse(value)
+            if (parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port
+                    or parsed.path or parsed.query or parsed.fragment or any(c.isspace() for c in value)):
+                raise ValueError()
+        except ValueError:
+            raise ValueError("Formato de proxy inválido.") from None
+    if webhook:
+        validate_webhook(webhook)
+    if proxy or body.get("clear_proxy"):
+        if s.proxy_path.exists():
+            backup = s.proxy_path.with_name(f"proxies-backup-{secrets.token_hex(8)}.txt")
+            atomic_write_text(backup, s.proxy_path.read_text(encoding="utf-8-sig"))
+        atomic_write_text(s.proxy_path, proxy + "\n" if proxy else "")
+    if webhook or body.get("clear_webhook"):
+        atomic_write_text(s.webhook_path, webhook + "\n" if webhook else "")
+    return web.json_response(s.connections())
+
+
+async def webhook_test(request):
+    await payload(request)
+    await request.app[SERVICE].send_webhook("XYB: conexión de webhook configurada correctamente.")
+    return web.json_response({"ok": True})
+
+
 async def favorites(request):
     s = request.app[SERVICE]
     body = await payload(request)
@@ -263,7 +360,8 @@ def create_app(root=PROJECT_ROOT, *, client_factory=None):
         web.post("/api/jobs", create_job), web.post("/api/jobs/{id}/action", job_action),
         web.get("/api/results", results), web.get("/api/export", export),
         web.post("/api/generate", generate), web.get("/api/input/{key}", input_file),
-        web.post("/api/settings", settings), web.post("/api/favorites", favorites),
+        web.post("/api/settings", settings), web.post("/api/connections", connections),
+        web.post("/api/webhook/test", webhook_test), web.post("/api/favorites", favorites),
         web.post("/api/shutdown", shutdown),
         web.static("/assets", PROJECT_ROOT / "web", show_index=False),
     ])

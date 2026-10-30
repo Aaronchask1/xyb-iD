@@ -205,7 +205,7 @@ class DiscordClient:
                         data = None
                     if response.status == 429:
                         self.rate_limits += 1
-                        delay = retry_delay(data, response.headers)
+                        delay = max(1.0, retry_delay(data, response.headers))
                         self.next_request = max(self.next_request, time.monotonic() + delay)
                         self.wait_until = time.time() + delay
                         if self.on_wait:
@@ -213,8 +213,11 @@ class DiscordClient:
                         result = Result(name, mode, "unverified", "Discord limitó las solicitudes; pendiente de reintento.", 429)
                         continue
                     if response.headers.get("X-RateLimit-Remaining") == "0":
-                        delay = retry_delay({}, {"Retry-After": response.headers.get("X-RateLimit-Reset-After")})
+                        delay = retry_delay({}, response.headers)
                         self.next_request = max(self.next_request, time.monotonic() + delay)
+                        self.wait_until = time.time() + delay
+                        if self.on_wait:
+                            self.on_wait(delay)
                     result = interpret(mode, name, response.status, data)
                     if response.status < 500:
                         break
@@ -288,21 +291,41 @@ class Store:
         self.db.execute("UPDATE jobs SET updated_at=? WHERE id=?", (utcnow(), job_id))
         self.db.commit()
 
-    def get_job(self, job_id):
-        row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    def get_job(self, job_id, *, include_candidates=True):
+        columns = "*, json_array_length(candidates) AS total" if include_candidates else (
+            "id, mode, state, created_at, updated_at, options, error, json_array_length(candidates) AS total")
+        row = self.db.execute(f"SELECT {columns} FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not row:
             raise ValueError("Sesión no encontrada.")
         job = dict(row)
-        job["candidates"] = json.loads(job["candidates"])
+        if include_candidates:
+            job["candidates"] = json.loads(job["candidates"])
         job["options"] = json.loads(job["options"])
-        job["total"] = len(job["candidates"])
         job["counts"] = dict(self.db.execute("SELECT status,COUNT(*) FROM results WHERE job_id=? GROUP BY status", (job_id,)))
         job["completed"] = sum(job["counts"].values())
         return job
 
     def jobs(self):
-        return [{k: v for k, v in self.get_job(row[0]).items() if k != "candidates"}
-                for row in self.db.execute("SELECT id FROM jobs ORDER BY rowid DESC LIMIT 100")]
+        rows = self.db.execute("""SELECT id, mode, state, created_at, updated_at, options, error,
+                                  json_array_length(candidates) AS total
+                                  FROM jobs ORDER BY rowid DESC LIMIT 100""").fetchall()
+        jobs = []
+        for row in rows:
+            job = dict(row)
+            job["options"] = json.loads(job["options"])
+            job["counts"] = {}
+            job["completed"] = 0
+            jobs.append(job)
+        by_id = {job["id"]: job for job in jobs}
+        if by_id:
+            placeholders = ",".join("?" for _ in by_id)
+            for job_id, status, count in self.db.execute(
+                f"SELECT job_id, status, COUNT(*) FROM results WHERE job_id IN ({placeholders}) GROUP BY job_id, status",
+                tuple(by_id),
+            ):
+                by_id[job_id]["counts"][status] = count
+                by_id[job_id]["completed"] += count
+        return jobs
 
     def results(self, job_id=None, *, status="", search="", offset=0, limit=100):
         clauses, args = [], []
@@ -354,8 +377,9 @@ def export_rows(rows, fmt):
 
 
 class JobManager:
-    def __init__(self, store, session, *, client_factory=DiscordClient):
+    def __init__(self, store, session, *, client_factory=DiscordClient, on_complete=None):
         self.store, self.session, self.client_factory = store, session, client_factory
+        self.on_complete = on_complete
         self.task = None
         self.active_id = None
         self.gate = asyncio.Event()
@@ -411,8 +435,14 @@ class JobManager:
                     result = await self.client.check(job["mode"], name)
                 self.store.save(job_id, result)
             self.store.state(job_id, "completed")
+            if self.on_complete:
+                try:
+                    await self.on_complete(job_id)
+                except Exception:
+                    pass  # Notification failures must not change saved session results.
         except asyncio.CancelledError:
-            self.store.state(job_id, "stopped")
+            if self.store.get_job(job_id)["state"] != "completed":
+                self.store.state(job_id, "stopped")
             raise
         except Exception:
             self.store.state(job_id, "failed", "La sesión falló. Los resultados ya guardados se conservan; puedes reanudarla.")
@@ -444,8 +474,7 @@ class JobManager:
     def live(self):
         if not self.active_id:
             return None
-        job = self.store.get_job(self.active_id)
-        job.pop("candidates")
+        job = self.store.get_job(self.active_id, include_candidates=False)
         elapsed = max(0.01, (self.finished or time.monotonic()) - self.started)
         job.update(requests=self.client.requests if self.client else 0,
                    rate_limits=self.client.rate_limits if self.client else 0,
@@ -458,6 +487,7 @@ class JobManager:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
             # A task cancelled before its first step never enters _run's finally.
-            self.store.state(self.active_id, "stopped")
+            if self.store.get_job(self.active_id)["state"] != "completed":
+                self.store.state(self.active_id, "stopped")
             if self.finished is None:
                 self.finished = time.monotonic()

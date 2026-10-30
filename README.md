@@ -30,7 +30,13 @@ La interfaz clásica continúa disponible mediante **Abrir xyb clasico.bat** o `
 - **Resultados:** búsqueda, filtros, páginas de 100 filas y exportación a CSV, JSON o TXT. Se exporta la sesión seleccionada con sus filtros actuales.
 - **Listas:** pegar texto, importar TXT o cargar listas existentes del proyecto desde el selector.
 - **Validación local:** comprueba formato sin conectar a Discord. No presenta esos resultados como disponibilidad.
-- **Ajustes:** intervalo, timeout y uso opcional de la primera línea de `data/proxies.txt`. La interfaz nunca muestra las credenciales del proxy.
+- **Ajustes:** intervalo, timeout, proxy y webhook de Discord desde la web. Las credenciales guardadas no vuelven a mostrarse en el navegador.
+
+## Proxy y webhook desde la web
+
+En **Ajustes → Conexión**, introduce el proxy (por ejemplo `usuario:contraseña@host:puerto` o `host:puerto:usuario:contraseña`) y guarda la conexión. Activa **Usar mi proxy guardado** y guarda los ajustes para aplicarlo a las próximas sesiones. Solo se usa la primera línea de `data/proxies.txt`: al cambiarla o borrarla desde la interfaz se conserva una copia local del archivo anterior en `data/proxies-backup-*.txt`.
+
+En la misma página puedes guardar una URL de webhook de Discord, enviar un mensaje de prueba y activar la notificación al completar una sesión. El mensaje contiene únicamente el tipo de sesión y el número de resultados. La configuración de notificación se toma al iniciar la sesión. Las credenciales se guardan localmente en `data/`, fuera de Git; quien tenga acceso a esos archivos puede leerlas.
 
 ## Cómo interpretar los resultados
 
@@ -50,7 +56,7 @@ La consulta de usuarios conserva el endpoint no documentado que utilizaba el pro
 
 ## Conexión y datos
 
-La interfaz nueva utiliza una solicitud a la vez y un intervalo configurable de 1 a 60 segundos. Respeta `retry_after`, `Retry-After` y los encabezados de agotamiento de cuota. Cambiar de proxy no evita la espera. Tras tres intentos sin respuesta concluyente, el resultado queda sin verificar.
+La interfaz nueva utiliza una solicitud a la vez y un intervalo configurable de 1 a 60 segundos. Respeta `retry_after`, `Retry-After` y los encabezados de agotamiento de cuota. Cambiar de proxy no evita la espera. Tras tres intentos sin respuesta concluyente, el resultado queda sin verificar. Las notificaciones usan su propio límite y muestran un error si Discord las rechaza.
 
 - `results/lab.sqlite3`: sesiones, resultados y favoritos nuevos.
 - `data/lab_settings.json`: ajustes de la interfaz nueva, sin tokens de usuario.
