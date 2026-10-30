@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CloudChecker v3.1 – Proxy manager with rotation, cooldowns, and scoring."""
+"""xyb Username Checker v3.1 – Proxy manager with rotation, cooldowns, and scoring."""
 
 from __future__ import annotations
 
@@ -81,7 +81,19 @@ class ProxyManager:
         if raw is None:
             return None
         raw = raw.strip()
-        return f"http://{raw}" if not raw.startswith("http") else raw
+        if raw.startswith("http"):
+            return raw
+
+        # Webshare's downloaded lists use host:port:username:password.
+        # aiohttp expects credentials before the host, so translate it while
+        # preserving the existing host:port and username:password@host:port
+        # input formats.
+        parts = raw.split(":", 3)
+        if len(parts) == 4 and "@" not in raw:
+            host, port, username, password = parts
+            return f"http://{username}:{password}@{host}:{port}"
+
+        return f"http://{raw}"
 
     # ── Core: next proxy ──
 

@@ -1,35 +1,21 @@
 #!/usr/bin/env python3
-"""CloudChecker v3.1 – Discord username availability checker.
+"""xyb Username Checker v3.1 – Discord username availability checker.
 
 Async engine, circuit-breaker for rotating proxies.
 """
 
 from __future__ import annotations
 
-# ── Python 3.13 SSL bug fix ───────────────────────────────────────────────
-import asyncio.sslproto as _sslproto
-
-_orig_eof = _sslproto.SSLProtocol.eof_received
-
-
-def _safe_eof(self):
-    try:
-        return _orig_eof(self)
-    except RuntimeError:
-        return False
-
-
-_sslproto.SSLProtocol.eof_received = _safe_eof
-# ──────────────────────────────────────────────────────────────────────────
-
 import argparse
 import asyncio
 import sys
 import time
 from pathlib import Path
+from contextlib import AsyncExitStack, ExitStack
 
 import aiohttp
 from rich.live import Live
+from rich.markup import escape
 
 from config import (
     PROJECT_ROOT,
@@ -41,6 +27,7 @@ from config import (
     Config,
     RunConfig,
     Stats,
+    atomic_write_text,
     ensure_dir,
     ensure_file,
 )
@@ -68,7 +55,7 @@ from wizard import setup_wizard
 
 def parse_args() -> AppSettings:
     parser = argparse.ArgumentParser(
-        description="CloudChecker – Discord username availability checker",
+        description="xyb Username Checker – Discord username availability checker",
     )
     parser.add_argument(
         "-d", "--debug",
@@ -83,7 +70,7 @@ def parse_args() -> AppSettings:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"CloudChecker v{__import__('config').VERSION}",
+        version=f"xyb Username Checker v{__import__('config').VERSION}",
     )
     args = parser.parse_args()
     return AppSettings(debug=args.debug, no_wizard=args.no_wizard)
@@ -97,10 +84,10 @@ async def _rps_calculator(stats: Stats, stop_event: asyncio.Event) -> None:
     """Update stats.rps and stats.checks_rps every second."""
     while not stop_event.is_set():
         prev_req = stats.requests
-        prev_done = stats.works + stats.taken
+        prev_done = stats.works + stats.taken + stats.unverified
         await asyncio.sleep(1)
         await stats.set_rps(float(stats.requests - prev_req))
-        await stats.set_checks_rps(float(stats.works + stats.taken - prev_done))
+        await stats.set_checks_rps(float(stats.works + stats.taken + stats.unverified - prev_done))
 
 
 # ---------------------------------------------------------------------------
@@ -108,12 +95,28 @@ async def _rps_calculator(stats: Stats, stop_event: asyncio.Event) -> None:
 # ---------------------------------------------------------------------------
 
 async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
+    # Close files/session even if setup, rendering, or result persistence fails.
+    with ExitStack() as files:
+        async with AsyncExitStack() as resources:
+            await _run_checker_body(cfg, settings, files, resources)
+
+
+async def _run_checker_body(cfg, settings, files, resources) -> None:
     """Core async checker with live display."""
 
     _hits_path = RESULTS_DIR / "hits.txt"
+    _available_path = RESULTS_DIR / "available.txt"
+    _taken_path = RESULTS_DIR / "taken.txt"
+    _unverified_path = RESULTS_DIR / "unverified.txt"
     _hits_path.parent.mkdir(parents=True, exist_ok=True)
-    _hits_file = _hits_path.open("a", encoding="utf-8")
-    _hits_lock = asyncio.Lock()
+    _hits_file = files.enter_context(_hits_path.open("a", encoding="utf-8"))
+    _available_file = files.enter_context(_available_path.open("a", encoding="utf-8"))
+    _taken_file = files.enter_context(_taken_path.open("a", encoding="utf-8"))
+    _unverified_file = files.enter_context(_unverified_path.open("a", encoding="utf-8"))
+    _results_lock = asyncio.Lock()
+    # Names that were previously uncertain but receive a definitive answer in
+    # this run.  They are removed from unverified.txt after all writers close.
+    resolved_unverified: set[str] = set()
 
     pm = ProxyManager(cfg.proxies, remove_on_fail=cfg.remove_bad_proxies, scored=cfg.scraped)
     stats = Stats()
@@ -137,7 +140,6 @@ async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
         limit=MAX_CONCURRENCY * 2,
         limit_per_host=0,
         force_close=False,
-        enable_cleanup_closed=True,
         ttl_dns_cache=300,
     )
     session_timeout = aiohttp.ClientTimeout(
@@ -145,11 +147,11 @@ async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
         sock_connect=5,
         sock_read=30,
     )
-    session = aiohttp.ClientSession(
+    session = await resources.enter_async_context(aiohttp.ClientSession(
         connector=connector,
         trust_env=False,
         timeout=session_timeout,
-    )
+    ))
 
     # Circuit breaker for rotating proxies
     cb: CircuitBreaker | None = None
@@ -174,7 +176,27 @@ async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
         )
 
     # Atomic index into the username list
-    names = list(cfg.usernames)
+    # Do not spend requests on usernames already confirmed in a previous run.
+    # Keep the original list untouched so it remains a complete record of
+    # generated candidates.
+    previously_checked: set[str] = set()
+    for confirmed_path in (_taken_path, _available_path, _hits_path):
+        if confirmed_path.exists():
+            previously_checked.update(
+                line.strip().lower()
+                for line in confirmed_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+
+    # Attempt history is not proof of a conclusive result.
+    pending_retry: set[str] = set()
+    if _unverified_path.exists():
+        pending_retry.update(
+            line.strip().lower()
+            for line in _unverified_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    names = [name for name in cfg.usernames if name.lower() not in previously_checked]
     total = len(names)
     _idx_lock = asyncio.Lock()
     _next_idx = 0
@@ -191,6 +213,14 @@ async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
     recent_hits: list[str] = []
     request_log: list[str] = []
 
+    async def _mark_unverified(name: str) -> None:
+        async with _results_lock:
+            if name.lower() not in pending_retry:
+                _unverified_file.write(f"{name}\n")
+                _unverified_file.flush()
+                pending_retry.add(name.lower())
+        await stats.inc_unverified()
+
     # Worker
     async def _worker(worker_id: int) -> None:
         while True:
@@ -198,36 +228,56 @@ async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
             if t is None:
                 return
             idx, name = t
+            recorded = False
 
             try:
                 result, data, code = await checker.check(session, name)
 
                 if result is True:
                     await stats.inc_works()
-                    async with _hits_lock:
+                    async with _results_lock:
                         _hits_file.write(f"{name}\n")
                         _hits_file.flush()
+                        _available_file.write(f"{name}\n")
+                        _available_file.flush()
+                        resolved_unverified.add(name.lower())
                     recent_hits.append(name)
-                    request_log.append(f"[{C.SUCCESS}]✓[/] {name}")
+                    request_log.append(f"[{C.SUCCESS}]✓[/] {escape(name)}")
                     if webhook:
                         webhook.enqueue(name)
 
                 elif result is False:
                     await stats.inc_taken()
-                    request_log.append(f"[{C.DANGER}]✗[/] {name}")
-
-                elif result == "EXHAUSTED":
-                    request_log.append(f"[{C.WARNING}]![/] proxies exhausted")
+                    async with _results_lock:
+                        _taken_file.write(f"{name}\n")
+                        _taken_file.flush()
+                        resolved_unverified.add(name.lower())
+                    request_log.append(f"[{C.DANGER}]✗[/] {escape(name)}")
 
                 else:
-                    request_log.append(f"[{C.WARNING}]?[/] {name}")
+                    await _mark_unverified(name)
+                    request_log.append(f"[{C.WARNING}]?[/] {escape(name)}")
+                recorded = True
 
                 if proxyless:
                     await asyncio.sleep(cfg.timeout)
 
-            except Exception:
-                request_log.append(f"[{C.DANGER}]!![/] {name}")
+            except asyncio.CancelledError:
+                if not recorded:
+                    await _mark_unverified(name)
+                raise
+            except OSError:
+                # A persistence failure must stop the run, not silently lose names.
+                raise
+            except Exception as exc:
+                if not recorded:
+                    await _mark_unverified(name)
+                dbg(f"Worker failure: {type(exc).__name__}")
+                request_log.append(f"[{C.DANGER}]!![/] {escape(name)}")
                 continue
+            finally:
+                del recent_hits[:-6]
+                del request_log[:-8]
 
     # Start background tasks
     stop_rps = asyncio.Event()
@@ -242,10 +292,11 @@ async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
     # Build live display function
     def _live_render():
         return live_card(
-            done=stats.works + stats.taken,
+            done=stats.works + stats.taken + stats.unverified,
             total=total,
             works=stats.works,
             taken=stats.taken,
+            unverified=stats.unverified,
             requests=stats.requests,
             ratelimited=stats.ratelimited,
             circuit_opens=stats.circuit_opens,
@@ -259,24 +310,29 @@ async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
         )
 
     console.print()
+    interrupted = False
     try:
         with Live(_live_render(), refresh_per_second=4, console=console) as live:
             while pending:
                 await asyncio.sleep(0.3)
 
                 # Remove completed tasks
-                pending = {w for w in pending if not w.done()}
+                completed = {w for w in pending if w.done()}
+                for worker in completed:
+                    worker.result()
+                pending -= completed
 
                 # Refill workers if any crashed
                 while _next_idx < total and len(pending) < cfg.concurrency:
                     pending.add(asyncio.create_task(_worker(len(pending))))
 
                 if not pending and _next_idx >= total:
+                    live.update(_live_render())
                     break
 
                 live.update(_live_render())
     except asyncio.CancelledError:
-        pass
+        interrupted = True
     finally:
         stop_rps.set()
         rps_task.cancel()
@@ -284,25 +340,48 @@ async def _run_checker(cfg: RunConfig, settings: AppSettings) -> None:
             w.cancel()
         if webhook_task:
             webhook_task.cancel()
-        await asyncio.sleep(0)
+        await asyncio.gather(rps_task, *pending,
+                             *([webhook_task] if webhook_task else []), return_exceptions=True)
 
     # Final summary
     elapsed = time.time() - start_time
     snap = await stats.snapshot()
 
     _hits_file.close()
-    await session.close()
+    _available_file.close()
+    _taken_file.close()
+    _unverified_file.close()
+
+    # Keep only still-uncertain names.  This makes retries consumable: a name
+    # that is confirmed taken/available does not remain queued forever.
+    if resolved_unverified and _unverified_path.exists():
+        still_unverified: list[str] = []
+        seen_unverified: set[str] = set()
+        for line in _unverified_path.read_text(encoding="utf-8").splitlines():
+            candidate = line.strip()
+            key = candidate.lower()
+            if candidate and key not in resolved_unverified and key not in seen_unverified:
+                still_unverified.append(candidate)
+                seen_unverified.add(key)
+        atomic_write_text(_unverified_path,
+            "\n".join(still_unverified) + ("\n" if still_unverified else ""),
+        )
 
     final_summary(
         requests=snap["requests"],
         works=snap["works"],
         taken=snap["taken"],
+        unverified=snap["unverified"],
+        interrupted=interrupted,
+        remaining=max(0, total - snap["works"] - snap["taken"] - snap["unverified"]),
         ratelimited=snap["ratelimited"],
         circuit_opens=snap["circuit_opens"],
         elapsed=elapsed,
         peak_rps=snap["peak_rps"],
         best_streak=snap["best_streak"],
     )
+    if interrupted:
+        raise asyncio.CancelledError
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +398,10 @@ def main() -> None:
     ensure_file(DATA_DIR / "config.json")
     ensure_file(DATA_DIR / "proxies.txt")
     ensure_file(DATA_DIR / "names_to_check.txt")
-    ensure_file(LOGS_DIR / "error.txt", clean=True)
-
-    config = Config()
+    ensure_file(LOGS_DIR / "error.txt")
 
     try:
+        config = Config()
         if settings.no_wizard:
             # Quick start: load from config + saved files
             from config import load_lines
@@ -355,6 +433,10 @@ def main() -> None:
     except (EOFError, KeyboardInterrupt):
         console.print(f"\n[{C.WARNING}]Aborted.[/]")
         sys.exit(0)
+    except (ValueError, OSError) as exc:
+        message = str(exc) if isinstance(exc, ValueError) else "Could not read or save a local file. Check access and disk space."
+        console.print(f"[{C.DANGER}]{message}[/]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

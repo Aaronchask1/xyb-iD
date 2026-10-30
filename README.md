@@ -1,159 +1,92 @@
-# ☁️ CloudChecker v3.1
+# xyb · Identity Lab 4.0
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-3.1.0-0A84FF?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/python-3.9%2B-30D158?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/async-aiohttp-FF9F0A?style=for-the-badge" />
-  <img src="https://hits.sh/github.com/Cloudzik1337/DiscordUsernameChecker.svg?style=for-the-badge&label=views&color=98989D" />
-</p>
+Herramienta local para organizar y consultar nombres de usuario de Discord y enlaces de servidor. Nueva interfaz en español con tema oscuro/violeta, sesiones en vivo, historial, favoritos y generador de candidatos.
 
-<p align="center">
-  <b>Tokenless Discord username checker. Async. Fast. Beautiful.</b><br>
-  <sub><a href="https://guns.lol/cloudzik1337">guns.lol/cloudzik1337</a></sub>
-</p>
+## Abrir
 
----
+Haz doble clic en **Abrir xyb.bat** dentro de `D:\nuevo`. Se abrirá el panel en el navegador:
 
-## ✨ What is this?
+http://127.0.0.1:8765
 
-CloudChecker blasts Discord's username availability API at maximum speed using async I/O, rotating proxies, and a `rich`-powered terminal UI. **No Discord token needed.**
+También puedes iniciarlo desde PowerShell:
 
-**v3.1** refines the full v3 rewrite — gone is the janky thread-spaghetti. In its place: `aiohttp` async concurrency, `rich`-powered CLI, guided wizard, circuit breaker, and a live streaming dashboard.
-
-![CloudChecker demo](showcase.gif)
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-Install **Python 3.9+** — [python.org/downloads](https://python.org/downloads)
-
-> ⚠️ On Windows: check **"Add Python to PATH"** during installation.
-
-Verify it's installed:
-```bash
-python --version
+```powershell
+cd D:\nuevo
+.\.venv\Scripts\python.exe server.py
 ```
 
-### Setup
+Si ya está abierto, el lanzador vuelve a abrir el panel existente. Para cerrar el servidor usa **Ajustes → Guardar y cerrar aplicación** o Ctrl+C en la terminal. Cerrar únicamente la pestaña deja la sesión ejecutándose.
 
-```bash
-git clone https://github.com/Cloudzik1337/DiscordUsernameChecker.git
-cd DiscordUsernameChecker
+La interfaz clásica continúa disponible mediante **Abrir xyb clasico.bat** o `checker.py`. Los archivos anteriores de `data` y `results` se conservan.
 
-# Create virtual environment
-python3 -m venv .venv          # macOS / Linux
-python -m venv .venv           # Windows
+## Qué incluye
 
-# Activate it
-source .venv/bin/activate      # macOS / Linux
-.venv\Scripts\activate         # Windows
+- **Usuarios:** normaliza `@nombre`, convierte a minúsculas, elimina duplicados y separa candidatos, nombres en uso, entradas inválidas y respuestas sin verificar.
+- **Vanities:** acepta códigos y enlaces `discord.gg/...` o `discord.com/invite/...`; muestra la invitación activa, servidor y cantidades aproximadas de miembros cuando Discord las proporciona. Conserva mayúsculas en los códigos de invitación.
+- **Sesiones:** progreso, solicitudes, pausa, reanudación, detención y reintento de pendientes. Una solicitud en curso puede terminar después de pulsar Pausar; la siguiente espera.
+- **Recuperación:** cada resultado se guarda en SQLite. Las sesiones interrumpidas se pueden reanudar desde Historial sin repetir resultados ya guardados.
+- **Generador local:** letras, números, combinaciones, prefijos, sufijos y patrones. `?` representa una letra y `#` un número; por ejemplo `??##`.
+- **Favoritos:** separados entre usuarios y vanities, con copia al portapapeles.
+- **Resultados:** búsqueda, filtros, páginas de 100 filas y exportación a CSV, JSON o TXT. Se exporta la sesión seleccionada con sus filtros actuales.
+- **Listas:** pegar texto, importar TXT o cargar listas existentes del proyecto desde el selector.
+- **Validación local:** comprueba formato sin conectar a Discord. No presenta esos resultados como disponibilidad.
+- **Ajustes:** intervalo, timeout y uso opcional de la primera línea de `data/proxies.txt`. La interfaz nunca muestra las credenciales del proxy.
 
-# Install dependencies
-pip install aiohttp rich
+## Cómo interpretar los resultados
 
-# Run
-python checker.py
+| Modo | Estado | Significado |
+|---|---|---|
+| Usuario | Candidato | El endpoint respondió explícitamente `taken=false`. Requiere confirmación al cambiar el nombre en Discord. |
+| Usuario | En uso | El endpoint respondió explícitamente `taken=true`. |
+| Vanity | Invitación activa | La invitación pública responde; puede ser una vanity o una invitación normal. |
+| Vanity | Sin invitación | Discord devolvió `Unknown Invite`. **No confirma que la vanity pueda asignarse.** |
+| Ambos | Sin verificar | Error de red, límite, rechazo o respuesta sin datos concluyentes. |
+| Ambos | Inválido | El formato no supera la validación local; no se envía una solicitud. |
+| Local | Formato válido | Solo validación de formato, sin consulta de disponibilidad. |
+
+Los nombres antiguos `Nombre#1234` no son nombres únicos actuales. Los puntos al inicio o final de un nombre sí son válidos; dos puntos consecutivos no lo son, según [las reglas oficiales de nombres](https://support.discord.com/hc/en-us/articles/12620128861463-New-Usernames-Display-Names).
+
+La consulta de usuarios conserva el endpoint no documentado que utilizaba el proyecto. Puede cambiar o dejar de responder; no constituye una reserva de nombre. Las vanities usan la [consulta oficial de invitaciones](https://docs.discord.com/developers/resources/invite#get-invite). La asignación definitiva se comprueba en los ajustes del servidor. [Discord explica las condiciones de los enlaces personalizados](https://support.discord.com/hc/en-us/articles/115001542132-Custom-Invite-Link).
+
+## Conexión y datos
+
+La interfaz nueva utiliza una solicitud a la vez y un intervalo configurable de 1 a 60 segundos. Respeta `retry_after`, `Retry-After` y los encabezados de agotamiento de cuota. Cambiar de proxy no evita la espera. Tras tres intentos sin respuesta concluyente, el resultado queda sin verificar.
+
+- `results/lab.sqlite3`: sesiones, resultados y favoritos nuevos.
+- `data/lab_settings.json`: ajustes de la interfaz nueva, sin tokens de usuario.
+- `web/`: interfaz local; no necesita CDNs, fuentes remotas ni compilación con Node.
+- `docs/RESEARCH-2026-10-29.md`: repositorios y documentación revisados.
+- `docs/README-v3.md`: documentación previa conservada como referencia histórica.
+
+No se importan automáticamente los antiguos resultados como conclusiones actuales. Puedes cargar las listas y consultarlas de nuevo. No se reescriben los históricos anteriores.
+
+El servidor escucha solo en `127.0.0.1`; las escrituras exigen un token de la sesión local y se rechazan orígenes externos. Los resultados y credenciales locales se excluyen de Git.
+
+## Instalación y pruebas
+
+El entorno existente fue probado con Python 3.15, aiohttp 3.14.5 y rich 15.0.0 en Windows. No se ha sustituido tu entorno.
+
+Para crear otro entorno:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Or: `./run.sh` (macOS/Linux only) — the wizard handles everything.
+Pruebas locales, sin consultar Discord ni enviar webhooks:
 
----
-
-## 🖥️ Live Dashboard
-
-```
-┌─ CloudChecker · 1247/5000 (25%) · 18s ────────────────────────────┐
-│                                                                    │
-│  Available   42          Taken        1205                         │
-│  Req/s       823         Requests     9641                         │
-│  Progress    1247/5000   Elapsed      18s                          │
-│  Proxies     48 alive    Workers      active                       │
-│                                                                    │
-│  Recent  cloud  zen  f9  xo  aero                                  │
-│  ✓ cloud  ✗ zen  ✗ f9  ✓ xo  ✓ aero  ✗ pixel  ✗ blaze  ✗ frost  │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Clean, real-time. No noise — just what matters.
+Puerto alternativo o inicio sin abrir navegador:
 
----
-
-## 🔧 The Wizard
-
-```
- Step 1  ● Proxies   — file, paste, or FREE scrape (3 APIs, dedup)
- Step 2  ○ Usernames — (f)ile or (g)enerate, just press a key
- Step 3  ○ Speed     — concurrency + timeout
- Step 4  ○ Webhook   — optional Discord notifications
+```powershell
+.\.venv\Scripts\python.exe server.py --port 8767 --no-browser
 ```
 
-Run with `--no-wizard` next time to skip straight to checking.
+La suite cubre clasificación estricta, límites, generación acotada, persistencia, cancelación y reanudación, exportaciones, protección del servidor local y compatibilidad con el runner clásico.
 
----
+## Créditos
 
-## 🌐 Proxy Modes
-
-| Mode            | Speed                | Setup              | Best for          |
-|-----------------|----------------------|--------------------|-------------------|
-| 🟢 Your proxies | 500–1000+ RPS        | file or paste      | Max performance   |
-| 🟡 Free scrape  | 200–500 RPS          | one `y` press      | Quick testing     |
-| 🔴 Proxyless    | ~1 RPS               | automatic fallback | No proxies        |
-
-> 💡 50,000 checks ≈ 25 MB. A 1 GB plan handles 40 full runs.
-
-Free sources: proxyscrape.com · geonode.com · openproxylist.xyz — auto-dedup, auto-test, auto-rotate.
-
----
-
-## 📈 v1 vs v3.1
-
-| Feature                | v1 (old.py)          | v3.1                                     |
-|------------------------|----------------------|------------------------------------------|
-| HTTP engine            | requests + threads   | aiohttp async (5–10× faster)             |
-| UI                     | raw ANSI + input()   | rich — live tables, panels, prompts      |
-| Free proxies           | no                   | 3-source scraper + dedup + auto-test     |
-| Proxy rotation         | basic cycle          | per-proxy cooldowns, 2-strike dead track |
-| Rate-limit handling    | recursion 💀         | circuit breaker + backoff                |
-| RPS (good proxies)     | 200–400              | **500–1000+**                            |
-| Username generator     | no                   | random, 3L, 4L, word patterns            |
-| Setup                  | config editing       | interactive wizard                       |
-| macOS                  | broken ❌            | fully tested ✅                          |
-
----
-
-## ⚡ Why async?
-
-```
-requests + threads  →  50 OS threads, GIL contention, ~300 RPS
-aiohttp + asyncio    →  1 event loop, zero GIL, ~800+ RPS
-```
-
-Every millisecond saved = thousands more checks per minute.
-
----
-
-## 📁 Project Structure
-
-```
-checker.py       entry point & runner
-config.py        settings, Stats, JSON config
-wizard.py        interactive 4-step setup
-proxy.py         proxy manager, scraping, rotation
-engine.py        HTTP checker, circuit breaker, webhooks
-ui.py            rich-powered live dashboard
-run.sh           one-command launcher
-```
-
----
-
-## 🙏 Credits
-
-- **Author** — [cloudzik1337](https://guns.lol/cloudzik1337)
-- **~2000 lines** of async, rich, and proxy magic
-- **Original** — `old/v1_threaded/old.py` (RIP you beautiful disaster)
-
-<sub>made with DeepSeek</sub>
+Esta actualización extiende el proyecto xyb existente. La documentación previa atribuía el checker original a [cloudzik1337](https://guns.lol/cloudzik1337). Los repositorios consultados se usaron como referencias de características; no se instalaron ni ejecutaron sus programas.

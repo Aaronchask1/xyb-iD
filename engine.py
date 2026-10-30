@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""CloudChecker v3.1 – Checker engine, circuit breaker, error aggregation, webhook."""
+"""xyb Username Checker v3.1 – Checker engine, circuit breaker, error aggregation, webhook."""
 
 from __future__ import annotations
 
 import asyncio
+import math
 import sys
 import time
 
@@ -118,7 +119,30 @@ class ErrorAggregator:
 # Checker – the core async checking loop
 # ---------------------------------------------------------------------------
 
-from config import ENDPOINT
+from config import ENDPOINT, is_valid_username
+
+
+def classify_response(status: int, data) -> bool | str:
+    """Only an explicit boolean in a successful response is conclusive."""
+    if status in (200, 201) and isinstance(data, dict) and type(data.get("taken")) is bool:
+        return not data["taken"]
+    return "ERROR"
+
+
+def retry_delay(data, headers) -> float:
+    """Use valid server delays; malformed bodies must not bypass a cooldown."""
+    candidates = [headers.get("Retry-After")]
+    if isinstance(data, dict):
+        candidates.append(data.get("retry_after"))
+    delays = []
+    for value in candidates:
+        try:
+            delay = float(value)
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if not isinstance(value, bool) and math.isfinite(delay) and delay >= 0:
+            delays.append(delay)
+    return max(delays) if delays else 5.0
 
 
 class Checker:
@@ -127,7 +151,7 @@ class Checker:
     Key behaviour:
     - Rotating proxy: retries until Discord gives a definitive answer.
       Connection errors get progressive backoff + circuit breaker.
-      The only hard stop is Discord returning 200/201/204/400.
+      Availability requires an explicit boolean taken value in a success response.
     - Static proxy list: cooldowns, 20 retries, 120 s total timeout.
     - Scraped free proxies: one shot per proxy, no retry.
     """
@@ -151,6 +175,7 @@ class Checker:
         self._scraped = scraped
         self._cb = circuit_breaker
         self._stats = stats  # Stats object for live counters
+        self._rate_limited_until = 0.0
 
         if scraped:
             self._max_retries = 1
@@ -168,14 +193,20 @@ class Checker:
 
         Returns:
             (True, data, code)  – available
-            (False, data, code) – taken or invalid
+            (False, data, code) – explicitly taken
             ("EXHAUSTED", None, None) – all proxies dead
             ("ERROR", None, None) – max retries exceeded
         """
         attempt = 0
         started = time.time()
 
+        if not is_valid_username(username):
+            return ("ERROR", None, None)
+
         while True:
+            # Shared across workers and proxies: changing IP must not bypass 429.
+            while self._rate_limited_until > time.monotonic():
+                await asyncio.sleep(self._rate_limited_until - time.monotonic())
             proxy = await self.pm.next()
             if proxy is None and not self.pm.is_proxyless:
                 return ("EXHAUSTED", None, None)
@@ -218,50 +249,29 @@ class Checker:
                     if resp.status == 429:
                         try:
                             data = await resp.json()
-                            cooldown = data.get("retry_after", 5)
                         except Exception:
-                            cooldown = 5
-
-                        if self._scraped:
-                            if proxy:
-                                self.pm.set_rate_limit(proxy, cooldown)
-                            if self._stats:
-                                await self._stats.inc_ratelimited()
-                            continue
-
-                        if self._rotating:
-                            # Fresh IP on next request — no point waiting
-                            if self._stats:
-                                await self._stats.inc_ratelimited()
-                            continue
-
+                            data = None
+                        cooldown = retry_delay(data, resp.headers)
+                        self._rate_limited_until = max(
+                            self._rate_limited_until, time.monotonic() + cooldown,
+                        )
                         if self._stats:
                             await self._stats.inc_ratelimited()
-                        if proxy:
-                            await self.pm.set_cooldown(proxy, cooldown)
-                        else:
-                            await self._err.inc("429_proxyless")
-                            await asyncio.sleep(cooldown)
                         continue
 
                     # ── Success (taken/available) ──
-                    if resp.status in (200, 201, 204):
+                    if resp.status in (200, 201, 204, 400):
                         try:
                             data = await resp.json()
                         except Exception:
-                            data = {}
-                        taken = data.get("taken", True)
-                        if self._scraped and proxy:
+                            data = None
+                        result = classify_response(resp.status, data)
+                        if type(result) is bool and self._scraped and proxy:
                             self.pm.score_hit(proxy)
-                        return (not taken, data, resp.status)
+                        return (result, data if isinstance(data, dict) else None, resp.status)
 
-                    # ── Invalid username (Discord says so) ──
-                    if resp.status == 400:
-                        try:
-                            data = await resp.json()
-                        except Exception:
-                            data = {}
-                        return (False, data, resp.status)
+                    if 400 <= resp.status < 500:
+                        return ("ERROR", None, resp.status)
 
                     # ── Unknown status – brief wait, retry ──
                     await self._err.inc(f"http_{resp.status}")
@@ -299,7 +309,7 @@ class Checker:
                 continue
 
             except Exception as exc:
-                dbg(f"  [{attempt}] {username} → {type(exc).__name__}: {exc!s:.100}")
+                dbg(f"  [{attempt}] {username} → {type(exc).__name__}")
                 await asyncio.sleep(0.3)
                 continue
 
@@ -412,7 +422,7 @@ class WebhookSender:
 
         payload = {
             "content": msg,
-            "username": "CloudChecker",
+            "username": "xyb",
             "avatar_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/9/95/Burning_Yellow_Sunset.jpg/1280px-Burning_Yellow_Sunset.jpg",
         }
 

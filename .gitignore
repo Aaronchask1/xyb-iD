@@ -14,3 +14,8 @@ build/
 dist/
 *.spec
 build.sh
+
+# Local lists, credentials, session database and scratch work
+data/
+results/
+work/

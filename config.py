@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""CloudChecker v3.1 – Configuration, constants, helpers, and data models."""
+"""xyb Username Checker v3.1 – Configuration, constants, helpers, and data models."""
 
 from __future__ import annotations
 
 import json
+import math
+import os
 import string
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,7 +68,7 @@ def load_lines(filepath: str | Path) -> list[str]:
     path = Path(filepath)
     if not path.exists():
         return []
-    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
 
 
 def is_valid_username(name: str) -> bool:
@@ -74,15 +77,30 @@ def is_valid_username(name: str) -> bool:
     - 2–32 characters
     - only a–z, 0–9, '_', '.'
     - no consecutive dots ('..')
-    - cannot start or end with a dot
     """
     if not (2 <= len(name) <= 32):
         return False
     if ".." in name:
         return False
-    if name.startswith(".") or name.endswith("."):
-        return False
     return all(c in USERNAME_CHARS for c in name)
+
+
+def atomic_write_text(path: str | Path, text: str) -> None:
+    """Replace a text file only after its complete contents are on disk."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", suffix=".tmp", delete=False) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +118,13 @@ class Config:
 
     def _load(self) -> None:
         if self._path.exists() and self._path.stat().st_size > 0:
-            self._data = json.loads(self._path.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8-sig"))
+            except (ValueError, UnicodeError) as exc:
+                raise ValueError("Invalid config.json: fix the JSON before starting; file preserved.") from exc
+            if not isinstance(data, dict):
+                raise ValueError("Invalid config.json: expected a JSON object; file preserved.")
+            self._data = data
         else:
             self._path.write_text("{}", encoding="utf-8")
 
@@ -108,10 +132,9 @@ class Config:
         return self._data.get(key, default)
 
     def set(self, key: str, value) -> None:
-        self._data[key] = value
-        self._path.write_text(
-            json.dumps(self._data, indent=2), encoding="utf-8"
-        )
+        updated = {**self._data, key: value}
+        atomic_write_text(self._path, json.dumps(updated, indent=2))
+        self._data = updated
 
     def get_all(self) -> dict:
         return dict(self._data)
@@ -141,6 +164,15 @@ class RunConfig:
     webhook_url: str | None = None
     webhook_message: str | None = None
 
+    def __post_init__(self) -> None:
+        if isinstance(self.concurrency, bool) or not isinstance(self.concurrency, int) or self.concurrency < 1:
+            raise ValueError("Concurrent workers must be a positive integer.")
+        if (isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float))
+                or not math.isfinite(self.timeout) or self.timeout <= 0):
+            raise ValueError("Timeout/delay must be a positive finite number.")
+        self.concurrency = min(self.concurrency, MAX_CONCURRENCY) if self.proxies else 1
+        self.usernames = list(dict.fromkeys(name.strip().lower() for name in self.usernames if name.strip()))
+
 
 @dataclass
 class Stats:
@@ -148,6 +180,7 @@ class Stats:
     requests: int = 0
     works: int = 0
     taken: int = 0
+    unverified: int = 0
     ratelimited: int = 0
     circuit_opens: int = 0
     rps: float = 0.0
@@ -181,6 +214,10 @@ class Stats:
         async with self._lock:
             self.ratelimited += 1
 
+    async def inc_unverified(self) -> None:
+        async with self._lock:
+            self.unverified += 1
+
     async def inc_circuit_open(self) -> None:
         async with self._lock:
             self.circuit_opens += 1
@@ -201,6 +238,7 @@ class Stats:
                 "requests": self.requests,
                 "works": self.works,
                 "taken": self.taken,
+                "unverified": self.unverified,
                 "ratelimited": self.ratelimited,
                 "circuit_opens": self.circuit_opens,
                 "rps": self.rps,

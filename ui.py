@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""CloudChecker v3.1 – terminal UI."""
+"""xyb Username Checker v3.1 – terminal UI."""
 
 from __future__ import annotations
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.columns import Columns
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich import box
 
-from config import C, VERSION
+from config import C, RESULTS_DIR, VERSION
 
 
 console = Console()
@@ -19,16 +20,51 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 def banner() -> Panel:
-    """Banner."""
-    inner = Text()
-    inner.append("CloudChecker", style=f"bold {C.PRIMARY}")
-    inner.append(f"  v{VERSION}", style=f"{C.MUTED}")
-    return Panel(
-        inner,
-        box=box.ROUNDED,
-        border_style=C.BORDER,
-        padding=(1, 4),
+    """Main application header."""
+    brand = Text(justify="center")
+    brand.append("XYB", style=f"bold {C.PRIMARY}")
+    brand.append("  USERNAME LAB", style="bold white")
+    subtitle = Text(
+        f"Interactive session console  •  v{VERSION}  •  results protected from duplicates",
+        style=C.MUTED,
+        justify="center",
     )
+    return Panel(
+        Group(brand, subtitle),
+        title=f"[{C.PRIMARY}]CONTROL CENTER[/]",
+        title_align="center",
+        box=box.DOUBLE,
+        border_style=C.BORDER,
+        padding=(1, 3),
+    )
+
+
+def _unique_line_count(path) -> int:
+    """Return a case-insensitive count without failing on a missing file."""
+    if not path.exists():
+        return 0
+    return len({line.strip().lower() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()})
+
+
+def history_summary() -> None:
+    """Show saved result state before a new scan starts."""
+    taken = _unique_line_count(RESULTS_DIR / "taken.txt")
+    available = _unique_line_count(RESULTS_DIR / "available.txt")
+    unverified = _unique_line_count(RESULTS_DIR / "unverified.txt")
+
+    def metric(label: str, value: int, color: str, detail: str) -> Panel:
+        body = Text(justify="center")
+        body.append(f"{value:,}\n", style=f"bold {color}")
+        body.append(label, style="white")
+        body.append(f"\n{detail}", style=C.MUTED)
+        return Panel(body, box=box.ROUNDED, border_style=color, padding=(0, 2))
+
+    console.print(Columns([
+        metric("TAKEN", taken, C.DANGER, "saved"),
+        metric("AVAILABLE", available, C.SUCCESS, "saved"),
+        metric("RETRY", unverified, C.WARNING, "unverified"),
+    ], equal=True, expand=True))
+    console.print(Text("  ✓ Confirmed names are excluded automatically on future scans.", style=C.MUTED))
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +172,7 @@ def live_card(
     paused: bool = False,
     recent: list[str] | None = None,
     feed: list[str] | None = None,
+    unverified: int = 0,
 ) -> Panel:
     """Build the live display panel for the checker runner."""
 
@@ -151,6 +188,7 @@ def live_card(
         "Available", f"[{C.SUCCESS}]{works}[/]",
         "Taken", f"[{C.DANGER}]{taken}[/]",
     )
+    inner.add_row("Unverified", f"[{C.WARNING}]{unverified}[/]", "Processed", f"{done}/{total}")
     inner.add_row(
         "Req/s", f"[{C.PRIMARY}]{rps:.0f}[/]",
         "Requests", str(requests),
@@ -181,7 +219,29 @@ def live_card(
         )
 
     content = Table(box=None, show_header=False, padding=(0, 0), expand=True)
+    state = "PAUSED" if paused else "SCANNING"
+    state_color = C.WARNING if paused else C.SUCCESS
+    status_line = Text()
+    status_line.append("● ", style=state_color)
+    status_line.append(state, style=f"bold {state_color}")
+    status_line.append("  •  live result stream  •  Ctrl+C stops safely", style=C.MUTED)
+    content.add_row(status_line)
     content.add_row(inner)
+
+    # Visual progress and a useful ETA based on completed username checks.
+    width = 30
+    filled = min(width, max(0, round(width * pct / 100)))
+    bar = Text("Progress  ", style=C.MUTED)
+    bar.append("█" * filled, style=C.PRIMARY)
+    bar.append("░" * (width - filled), style=C.BORDER)
+    if checks_rps > 0 and done < total:
+        eta = f"  ETA {(total - done) / checks_rps:.0f}s"
+    elif done >= total:
+        eta = "  complete"
+    else:
+        eta = "  estimating…"
+    bar.append(eta, style=C.MUTED)
+    content.add_row(bar)
 
     # Status banner for heavy rate-limiting
     if ratelimited > 0 and (done == 0 or ratelimited > done * 2):
@@ -210,13 +270,13 @@ def live_card(
         feed_str = "  ".join(feed[-8:])
         content.add_row(Text.from_markup(feed_str))
 
-    status = f"⌛ rate-limited" if (ratelimited > 0 and done == 0) else f"{done}/{total} ({pct:.0f}%)"
+    status = f"rate-limited" if (ratelimited > 0 and done == 0) else f"{done:,}/{total:,} ({pct:.0f}%)"
     return Panel(
         content,
-        title=f"[{C.PRIMARY}]CloudChecker[/] · {status} · [dim]{elapsed:.0f}s[/]",
+        title=f"[{C.PRIMARY}]XYB LIVE[/]  {status}  [dim]{elapsed:.0f}s[/]",
         title_align="left",
-        box=box.ROUNDED,
-        border_style=C.BORDER if not paused else C.WARNING,
+        box=box.DOUBLE,
+        border_style=state_color,
         padding=(1, 2),
     )
 
@@ -234,6 +294,9 @@ def final_summary(
     elapsed: float,
     peak_rps: float = 0.0,
     best_streak: int = 0,
+    unverified: int = 0,
+    interrupted: bool = False,
+    remaining: int = 0,
 ) -> None:
     """Print the final results card."""
     console.print()
@@ -245,6 +308,9 @@ def final_summary(
     t.add_column(style="white")
     t.add_row("Available", f"[{C.SUCCESS} bold]{works}[/]")
     t.add_row("Taken", f"[{C.DANGER} bold]{taken}[/]")
+    t.add_row("Unverified", f"[{C.WARNING}]{unverified}[/]")
+    if remaining:
+        t.add_row("Not processed", str(remaining))
     t.add_row("Requests", str(requests))
     if ratelimited > 0:
         t.add_row("Rate limited", f"[{C.WARNING}]{ratelimited}[/]")
@@ -261,7 +327,7 @@ def final_summary(
 
     console.print(Panel(
         t,
-        title=f"[{C.SUCCESS}]Done[/] · {elapsed:.0f}s",
+        title=f"[{C.WARNING if interrupted else C.SUCCESS}]{'Stopped' if interrupted else 'Done'}[/] · {elapsed:.0f}s",
         title_align="left",
         box=box.ROUNDED,
         border_style=C.SUCCESS,

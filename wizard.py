@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CloudChecker v3.1 – Setup wizard and proxy scraper."""
+"""xyb Username Checker v3.1 – Setup wizard and proxy scraper."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from config import (
     DATA_DIR,
     MAX_CONCURRENCY,
     PROJECT_ROOT,
+    RESULTS_DIR,
     USERNAME_CHARS,
     AppSettings,
     Config,
@@ -35,6 +36,7 @@ from ui import (
     fail,
     info,
     info_card,
+    history_summary,
     ok,
     progress_steps,
     section,
@@ -44,6 +46,7 @@ from ui import (
 # Default file paths (absolute, under DATA_DIR)
 DEFAULT_PROXY_FILE = str(DATA_DIR / "proxies.txt")
 DEFAULT_NAMES_FILE = str(DATA_DIR / "names_to_check.txt")
+CUSTOM_COMBINATIONS_FILE = str(DATA_DIR / "custom_combinations.txt")
 
 # Clean display versions (shown in prompts, not full absolute paths)
 _PROXY_FILE_DISPLAY = "data/proxies.txt"
@@ -57,9 +60,17 @@ def _resolve_input_path(raw: str) -> str:
     script works regardless of the current working directory.
     """
     p = Path(raw).expanduser()
-    if not p.is_absolute():
-        p = PROJECT_ROOT / p
-    return str(p)
+    if p.is_absolute():
+        return str(p)
+
+    # A plain filename is commonly pasted from the results folder.  Resolve
+    # project-relative paths first, then fall back to the standard folders so
+    # inputs such as "used_tags.txt" work without requiring a full path.
+    for candidate in (PROJECT_ROOT / p, RESULTS_DIR / p, DATA_DIR / p):
+        if candidate.exists():
+            return str(candidate)
+
+    return str(PROJECT_ROOT / p)
 
 # Regex: matches host:port with optional http:// and optional user:pass@
 #   "1.2.3.4:8080"                                 ✓
@@ -82,6 +93,8 @@ async def setup_wizard(config: Config, settings: AppSettings) -> RunConfig:
 
     console.clear()
     console.print(banner())
+    console.print()
+    history_summary()
     console.print()
     console.print(progress_steps(0))
 
@@ -232,14 +245,29 @@ async def _step_proxies(config: Config) -> tuple[list[str], bool, bool]:
 def _step_usernames() -> list[str]:
     """Guide user through username list setup."""
     raw = Prompt.ask(
-        f"[{C.PRIMARY}](f)ile[/] or [{C.PRIMARY}](g)enerate[/] usernames?",
-        choices=["f", "g"],
+        f"[{C.PRIMARY}](f)ile[/]  [{C.PRIMARY}](g)enerate[/]  [{C.PRIMARY}](r)etry pending[/]  [{C.PRIMARY}](3) remaining 3-char[/]",
+        choices=["f", "g", "r", "3"],
         default="f",
     )
-    mode = "generate" if raw == "g" else "file"
+    # Generate always begins with the type picker (numbers, letters, or a
+    # custom combination); it should never jump straight to username length.
+    mode = "custom" if raw == "g" else "file"
     usernames: list[str] = []
 
-    if mode == "file":
+    quick_files = {
+        "r": ("results/unverified.txt", "pending retry"),
+        "3": ("data/remaining_3char_to_check.txt", "remaining 3-char"),
+    }
+    if raw in quick_files:
+        display_path, label = quick_files[raw]
+        usernames = load_lines(_resolve_input_path(display_path))
+        if usernames:
+            ok(f"Loaded {len(usernames)} {label} usernames")
+        else:
+            fail(f"No usernames found in {display_path}.")
+            mode = "file"
+
+    if mode == "file" and not usernames:
         names_path = Prompt.ask("Path to username file", default=_NAMES_FILE_DISPLAY)
         usernames = load_lines(_resolve_input_path(names_path))
         if not usernames:
@@ -271,6 +299,71 @@ def _step_usernames() -> list[str]:
         Path(DEFAULT_NAMES_FILE).write_text("\n".join(usernames), encoding="utf-8")
         ok(f"Generated {len(usernames)} usernames (of {total:,} possible)")
 
+    if mode == "custom":
+        usernames = _custom_combinations()
+
+    return usernames
+
+
+def _custom_combinations() -> list[str]:
+    """Build a bounded, valid username list from a user-supplied character set."""
+    kind = Prompt.ask(
+        f"[{C.PRIMARY}]Generate:[/] [1] numbers only  [2] letters only  [3] combinations",
+        choices=["1", "2", "3"],
+        default="3",
+    )
+    if kind == "1":
+        chars = "0123456789"
+        ok("Using numbers only: 0-9")
+    elif kind == "2":
+        chars = "abcdefghijklmnopqrstuvwxyz"
+        ok("Using letters only: a-z")
+    else:
+        console.print(f"[{C.MUTED}]Use the default for a-z, 0-9, _ and .; or write your own set, e.g. abc123_.[/]")
+        while True:
+            raw_chars = Prompt.ask("Characters to combine", default=USERNAME_CHARS)
+            # Preserve order so the output is deterministic, while removing
+            # repeats and separators typed for readability.
+            chars = "".join(dict.fromkeys(ch for ch in raw_chars.lower() if ch in USERNAME_CHARS))
+            if chars:
+                break
+            fail("Use at least one valid character: a-z, 0-9, _ or .")
+
+    length = IntPrompt.ask("Length per username", default=3, choices=["2", "3", "4", "5"])
+    total = len(chars) ** length
+    default_limit = min(50_000, total)
+    limit = IntPrompt.ask("Maximum combinations to create", default=default_limit)
+    limit = max(1, min(limit, 100_000, total))
+
+    # Never feed the checker alphabetic batches such as aaaa, aaab, aaac.
+    # For manageable spaces, build every valid result and shuffle it.  For
+    # larger spaces, draw unique random candidates directly.
+    if total <= 100_000:
+        usernames = [
+            "".join(combination)
+            for combination in itertools.product(chars, repeat=length)
+            if is_valid_username("".join(combination))
+        ]
+        random.shuffle(usernames)
+        usernames = usernames[:limit]
+    else:
+        usernames = []
+        seen: set[str] = set()
+        max_attempts = limit * 100
+        attempts = 0
+        while len(usernames) < limit and attempts < max_attempts:
+            attempts += 1
+            candidate = "".join(random.choices(chars, k=length))
+            if candidate not in seen and is_valid_username(candidate):
+                seen.add(candidate)
+                usernames.append(candidate)
+
+    if not usernames:
+        fail("Those characters cannot form a valid username at that length.")
+        return []
+
+    Path(CUSTOM_COMBINATIONS_FILE).write_text("\n".join(usernames) + "\n", encoding="utf-8")
+    ok(f"Created {len(usernames):,} random valid combinations in data/custom_combinations.txt")
     return usernames
 
 
@@ -294,7 +387,8 @@ def _step_speed(proxies: list[str], scraped: bool = False) -> tuple[int, int]:
         timeout = IntPrompt.ask("Request timeout (seconds)", default=5)
         return conc, timeout
 
-    default_conc = min(MAX_CONCURRENCY, max(10, len(proxies) * 5))
+    # A moderate default avoids immediately triggering Discord rate limits.
+    default_conc = min(50, max(10, len(proxies)))
     concurrency = IntPrompt.ask("Concurrent workers", default=default_conc)
     if concurrency > MAX_CONCURRENCY:
         warn_card(f"Capped at {MAX_CONCURRENCY} — beyond this the program freezes.")
