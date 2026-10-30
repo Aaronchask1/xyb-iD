@@ -386,6 +386,7 @@ class JobManager:
         self.saved_on_start = self.store.get_job(job_id)["completed"]
         self.cooldown_until = 0
         self.finished = None
+        self.client = None
         self.task = asyncio.create_task(self._run(job_id, proxy))
 
     async def _run(self, job_id, proxy):
@@ -436,8 +437,7 @@ class JobManager:
             self.gate.set()
             self.store.state(job_id, "running")
         elif action == "stop":
-            self.task.cancel()
-            await asyncio.gather(self.task, return_exceptions=True)
+            await self.close()
         else:
             raise ValueError("Acción desconocida.")
 
@@ -457,3 +457,7 @@ class JobManager:
         if self.busy():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+            # A task cancelled before its first step never enters _run's finally.
+            self.store.state(self.active_id, "stopped")
+            if self.finished is None:
+                self.finished = time.monotonic()

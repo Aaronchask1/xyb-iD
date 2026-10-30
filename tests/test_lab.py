@@ -301,6 +301,16 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         self.manager.start('username',['xyb'],self.options)
         with self.assertRaises(ValueError):
             self.manager.start('vanity',['xyb'],self.options)
+    async def test_stop_before_worker_starts_marks_job_stopped(self):
+        job=self.manager.start('username',['xyb'],self.options)
+        await self.manager.action(job,'stop')
+        self.assertEqual(self.store.get_job(job)['state'],'stopped')
+        self.assertEqual(self.store.get_job(job)['completed'],0)
+        self.assertFalse(self.manager.busy())
+    async def test_close_before_worker_starts_marks_job_stopped(self):
+        job=self.manager.start('username',['xyb'],self.options)
+        await self.manager.close()
+        self.assertEqual(self.store.get_job(job)['state'],'stopped')
     async def test_offline_does_not_call_network_and_counts_invalid(self):
         job=self.manager.start('username',['xyb','a..b'],{**self.options,'offline':True})
         await self.manager.task
@@ -391,6 +401,10 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_export_and_empty_job(self):
         self.assertEqual((await self.client.get('/api/export')).status,400)
         self.assertEqual((await self.post('/api/jobs',{'candidates':''})).status,400)
+    async def test_oversized_pagination_offset_returns_validation_error(self):
+        response=await self.client.get('/api/results?offset='+str(2**64))
+        self.assertEqual(response.status,400)
+        self.assertIn('error',await response.json())
 
 
 class LegacyRunnerTests(unittest.IsolatedAsyncioTestCase):

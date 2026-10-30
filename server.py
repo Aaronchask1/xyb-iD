@@ -184,6 +184,8 @@ async def job_action(request):
 async def results(request):
     s = request.app[SERVICE]
     offset = max(0, int(request.query.get("offset", 0)))
+    if offset > 2**63 - 1:
+        raise ValueError("La posición de página es demasiado grande.")
     data = s.store.results(request.query.get("job"), status=request.query.get("status", ""),
                            search=request.query.get("search", "")[:256], offset=offset, limit=100)
     return web.json_response(data)
